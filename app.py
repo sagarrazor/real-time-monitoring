@@ -311,7 +311,7 @@ def render_pane(df, dimension, title, gran):
 if __name__ == "__main__":
     if 'logged_in' not in st.session_state:
         with st.form("login"):
-            st.title("🛡️ Ops Secure Gateway")
+            st.title("🛡️ Login")
             u = st.text_input("LDAP")
             p = st.text_input("Password", type="password")
             if st.form_submit_button("Launch"):

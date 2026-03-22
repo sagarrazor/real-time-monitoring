@@ -445,14 +445,14 @@ if __name__ == "__main__":
                 (d['method']=='emi')&(d['lt']=='credit')
             ]
             vals =[
-                'Debit-Recur-Init', 
-                'Debit-Recur-Auto', 
-                'Credit-Recur-Init', 
-                'Credit-Recur-Auto', 
-                'Debit-Intl', 
-                'Credit-Intl', 
-                'Debit-Dom', 
-                'Credit-Dom', 
+                'Debit-Recurring-Initial', 
+                'Debit-Recurring-Auto', 
+                'Credit-Recurring-Initial', 
+                'Credit-Recurring-Auto', 
+                'Debit-International', 
+                'Credit-International', 
+                'Debit-Domestic', 
+                'Credit-Domestic', 
                 'DC EMI', 
                 'CC EMI'
             ]
@@ -482,8 +482,8 @@ if __name__ == "__main__":
                 (d['recurring_type'] == 'auto')
             ]
             vals =[
-                'Autopay-Coll-Init', 
-                'Autopay-Int-Init', 
+                'Autopay-Coll-Initial', 
+                'Autopay-Int-Initial', 
                 'Autopay-Auto'
             ]
             d['method_drilled'] = np.select(cond, vals, default='Autopay Unknown')
@@ -508,19 +508,19 @@ if __name__ == "__main__":
         'CC on UPI Collect': "method='upi' AND reference2='credit_card' AND flow='collect' AND recurring=0 AND international=0",
         'Credit Card - Domestic': "method='card' AND type='credit' AND international=0 AND recurring=0",
         'Debit Card - Domestic': "method='card' AND type='debit' AND international=0 AND recurring=0",
-        'Credit Card - Intl': "method='card' AND type='credit' AND international=1 AND recurring=0",
-        'Debit Card - Intl': "method='card' AND type='debit' AND international=1 AND recurring=0",
+        'Credit Card - International': "method='card' AND type='credit' AND international=1 AND recurring=0",
+        'Debit Card - International': "method='card' AND type='debit' AND international=1 AND recurring=0",
         'CC EMI': "method='emi' AND type='credit'",
         'DC EMI': "method='emi' AND type='debit'",
-        'Credit Card - Recur Init': "method='card' AND type='credit' AND recurring=1 AND recurring_type IN ('initial','card_change')",
-        'Credit Card - Recur Auto': "method='card' AND type='credit' AND recurring=1 AND recurring_type='auto'",
-        'Debit Card - Recur Init': "method='card' AND type='debit' AND recurring=1 AND recurring_type IN ('initial','card_change')",
-        'Debit Card - Recur Auto': "method='card' AND type='debit' AND recurring=1 AND recurring_type='auto'",
+        'Credit Card - Recurring Initial': "method='card' AND type='credit' AND recurring=1 AND recurring_type IN ('initial','card_change')",
+        'Credit Card - Recurring Auto': "method='card' AND type='credit' AND recurring=1 AND recurring_type='auto'",
+        'Debit Card - Recurring Initial': "method='card' AND type='debit' AND recurring=1 AND recurring_type IN ('initial','card_change')",
+        'Debit Card - Recurring Auto': "method='card' AND type='debit' AND recurring=1 AND recurring_type='auto'",
         'Netbanking': "method='netbanking'",
         'Cred Pay / App': "method='app'",
         'Wallet': "method='wallet'",
-        'UPI Autopay - Intent Init': "method='upi' AND recurring=1 AND recurring_type='initial' AND flow='intent'",
-        'UPI Autopay - Collect Init': "method='upi' AND recurring=1 AND recurring_type='initial' AND flow='collect'",
+        'UPI Autopay - Intent Initial': "method='upi' AND recurring=1 AND recurring_type='initial' AND flow='intent'",
+        'UPI Autopay - Collect Initial': "method='upi' AND recurring=1 AND recurring_type='initial' AND flow='collect'",
         'UPI Autopay - Auto': "method='upi' AND recurring=1 AND recurring_type='auto'",
         'Emandate - Initial': "method='emandate' AND recurring_type='initial'",
         'Emandate - Auto': "method='emandate' AND recurring_type='auto'",

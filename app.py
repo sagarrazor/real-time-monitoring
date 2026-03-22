@@ -15,7 +15,7 @@ from streamlit_autorefresh import st_autorefresh
 
 # --- 1. GLOBAL CONFIG & CLEANUP ---
 warnings.filterwarnings("ignore")
-st.set_page_config(page_title="Ops Command Center Pro", page_icon="🛰️", layout="wide")
+st.set_page_config(page_title="Real Time Monitoring", page_icon="🛰️", layout="wide")
 DB_PATH = 'payment_data.db'
 
 def purge_db():
@@ -382,7 +382,7 @@ if __name__ == "__main__":
             
     st.divider()
 
-    tab1, tab2, tab3, tab4, tab5 = st.tabs(["📱 Standard UPI", "💳 Cards", "🏦 NB & App", "🔁 UPI Recurring", "🔄 Emandate & NACH"])
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(["📱 Standard UPI", "💳 Cards", "🏦 NB & Affordibility", "🔁 UPI Recurring", "🔄 Emandate & NACH"])
 
     with tab1:
         d = get_data('upi_data')
@@ -441,7 +441,7 @@ if __name__ == "__main__":
                 'CC EMI'
             ]
             d['method_drilled'] = np.select(cond, vals, default='Other Card')
-            render_pane(d, 'method_drilled', "Card Matrix SR Trend", gran)
+            render_pane(d, 'method_drilled', "Card Method Trend", gran)
             render_pane(d, 'cps_route', "Cards CPS Performance", gran)
             render_pane(d[d['lt']=='credit'], 'network', "CC Network Health", gran)
             render_pane(d[d['lt']=='credit'], 'gateway', "CC Gateway Performance", gran)
@@ -468,9 +468,9 @@ if __name__ == "__main__":
                 (d['recurring_type'] == 'auto')
             ]
             vals =[
-                'Autopay-Coll-Initial', 
-                'Autopay-Int-Initial', 
-                'Autopay-Auto'
+                'Autopay-Collect-Initial', 
+                'Autopay-Intent-Initial', 
+                'Autopay-Collect-Auto'
             ]
             d['method_drilled'] = np.select(cond, vals, default='Autopay Unknown')
             render_pane(d, 'method_drilled', "UPI Recurring Matrix", gran)

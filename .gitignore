@@ -1,0 +1,18 @@
+# Databases & SQLite WAL files
+payment_data.db
+payment_data.db-shm
+payment_data.db-wal
+*.sqlite3
+*.db
+*.db-shm
+*.db-wal
+
+# Python Cache
+__pycache__/
+*.pyc
+.DS_Store
+
+# Virtual Environments
+venv/
+env/
+.env/

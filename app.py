@@ -364,7 +364,7 @@ if __name__ == "__main__":
             return df[df['dt'] >= df['dt'].max() - timedelta(hours=lb)]
         except Exception: return pd.DataFrame()
 
-    st.title("🛡️ Ops Command Center Pro")
+    st.title("🛡️ Real Time Monitoring")
 
     # --- ALWAYS VISIBLE DOWNTIME ALERTS UI ---
     try:

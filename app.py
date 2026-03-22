@@ -80,7 +80,8 @@ def init_db():
             start_time TEXT, 
             end_time TEXT, 
             status TEXT,
-            peak_failures INTEGER
+            peak_failures INTEGER,
+            anomaly_score REAL
         )
     """)
     
@@ -101,60 +102,50 @@ def log_event(msg):
         pass
 
 # --- 3. BACKGROUND WORKER & ENHANCED DOWNTIME LOGIC ---
-def check_downtimes(df, method_name, l1_col, conn):
-    """Checks for 0% SR anomalies and drops the +00:00 timezone format."""
-    if df.empty or l1_col not in df.columns: 
-        return
-        
+def check_downtimes(df, method_name, l1_col, conn, table_name):
+    if df.empty or l1_col not in df.columns: return
     latest_dt = df['dt'].max()
-    # Formatting to strip any +00:00 timezone attachments
     time_str = pd.to_datetime(latest_dt).strftime('%Y-%m-%d %H:%M:%S')
     
-    recent = df[df['dt'] == latest_dt].groupby(l1_col).agg({
-        'attempts': 'sum', 
-        'success': 'sum'
-    }).reset_index()
+    # Current Performance
+    recent = df[df['dt'] == latest_dt].groupby(l1_col).agg({'attempts': 'sum', 'success': 'sum'}).reset_index()
     
+    # Fetch 2-hour history from SQLite for baseline
+    try:
+        history_query = f"SELECT {l1_col}, attempts, success FROM {table_name} WHERE dt >= datetime('now', '-2 hours')"
+        hist_df = pd.read_sql(history_query, conn)
+    except: hist_df = pd.DataFrame()
+
     for _, row in recent.iterrows():
         name = str(row[l1_col])
-        if name.strip() == '' or name.lower() in['nan', 'none', 'unknown']:
-            continue
+        if name.strip() == '' or name.lower() in ['nan', 'none', 'unknown']: continue
             
-        attempts = int(row['attempts'])
-        success = int(row['success'])
-        
-        if attempts > 20 and success == 0:
-            exists = pd.read_sql(
-                f"SELECT id FROM downtime_logs WHERE method='{method_name}' AND l1_name='{name}' AND status='CRITICAL'", 
-                conn
-            )
+        cur_att = int(row['attempts'])
+        cur_sr = (row['success'] / cur_att * 100) if cur_att > 0 else 0
+        status, score = None, 0.0
+
+        if cur_att > 20 and row['success'] == 0:
+            status, score = "CRITICAL", 99.0 # Hard downtime
+        elif not hist_df.empty and cur_att > 50:
+            h = hist_df[hist_df[l1_col] == name].copy()
+            if len(h) > 10:
+                h['sr'] = (h['success'] / h['attempts'] * 100).fillna(0)
+                mean_sr, std_sr = h['sr'].mean(), h['sr'].std()
+                z = (cur_sr - mean_sr) / std_sr if std_sr > 0.5 else 0
+                if z < -3.0: # 3 Sigma Drop
+                    status, score = "DEGRADED", abs(round(z, 2))
+
+        if status:
+            exists = pd.read_sql(f"SELECT id FROM downtime_logs WHERE method='{method_name}' AND l1_name='{name}' AND status IN ('CRITICAL', 'DEGRADED')", conn)
             if exists.empty:
-                conn.execute(
-                    """
-                    INSERT INTO downtime_logs (method, l1_type, l1_name, start_time, status, peak_failures) 
-                    VALUES (?, ?, ?, ?, ?, ?)
-                    """,
-                    (method_name, l1_col, name, time_str, "CRITICAL", attempts)
-                )
+                conn.execute("INSERT INTO downtime_logs (method, l1_type, l1_name, start_time, status, peak_failures, anomaly_score) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                             (method_name, l1_col, name, time_str, status, cur_att, score))
             else:
-                conn.execute(
-                    """
-                    UPDATE downtime_logs 
-                    SET peak_failures = MAX(peak_failures, ?) 
-                    WHERE method = ? AND l1_name = ? AND status = 'CRITICAL'
-                    """,
-                    (attempts, method_name, name)
-                )
-                
-        elif success > 0:
-            conn.execute(
-                """
-                UPDATE downtime_logs 
-                SET end_time = ?, status = 'RESOLVED' 
-                WHERE method = ? AND l1_name = ? AND status = 'CRITICAL'
-                """,
-                (time_str, method_name, name)
-            )
+                conn.execute("UPDATE downtime_logs SET peak_failures = MAX(peak_failures, ?), anomaly_score = MAX(anomaly_score, ?) WHERE method = ? AND l1_name = ? AND status IN ('CRITICAL', 'DEGRADED')",
+                             (cur_att, score, method_name, name))
+        elif cur_sr > 0:
+            conn.execute("UPDATE downtime_logs SET end_time = ?, status = 'RESOLVED' WHERE method = ? AND l1_name = ? AND status IN ('CRITICAL', 'DEGRADED')",
+                         (time_str, method_name, name))
 
 def execute_single_sync(table_name, sql, user, pwd):
     """Executes a sync task and applies domain-specific downtime checks."""
@@ -168,23 +159,23 @@ def execute_single_sync(table_name, sql, user, pwd):
                 
             df.to_sql(table_name, conn, if_exists='append', index=False)
             
-            if table_name == 'upi_data': 
-                check_downtimes(df, 'Standard UPI', 'gateway', conn)
-                check_downtimes(df, 'Standard UPI', 'bank', conn)
-                check_downtimes(df, 'Standard UPI', 'cps_route', conn)
-            elif table_name == 'cards_data': 
-                check_downtimes(df, 'Cards', 'issuer', conn)
-                check_downtimes(df, 'Cards', 'network', conn)
-                check_downtimes(df, 'Cards', 'gateway', conn)
-            elif table_name == 'nb_data': 
-                check_downtimes(df, 'Netbanking', 'bank', conn)
-                check_downtimes(df, 'Netbanking', 'gateway', conn)
-            elif table_name == 'emandate_data':
-                check_downtimes(df, 'Emandate', 'bank', conn)
-                
-            conn.commit()
-            conn.close()
-            log_event(f"✅ {table_name} Sync Complete.")
+        if table_name == 'upi_data': 
+            check_downtimes(df, 'Standard UPI', 'gateway', conn, table_name)
+            check_downtimes(df, 'Standard UPI', 'bank', conn, table_name)
+            check_downtimes(df, 'Standard UPI', 'cps_route', conn, table_name)
+        elif table_name == 'cards_data': 
+            check_downtimes(df, 'Cards', 'issuer', conn, table_name)
+            check_downtimes(df, 'Cards', 'network', conn, table_name)
+            check_downtimes(df, 'Cards', 'gateway', conn, table_name)
+        elif table_name == 'nb_data': 
+            check_downtimes(df, 'Netbanking', 'bank', conn, table_name)
+            check_downtimes(df, 'Netbanking', 'gateway', conn, table_name)
+        elif table_name == 'emandate_data':
+            check_downtimes(df, 'Emandate', 'bank', conn, table_name)
+            
+        conn.commit()
+        conn.close()
+        log_event(f"✅ {table_name} Sync Complete.")
     except Exception as e: 
         log_event(f"❌ {table_name} Failed: {str(e)[:50]}")
 
@@ -369,32 +360,25 @@ if __name__ == "__main__":
     # --- ALWAYS VISIBLE DOWNTIME ALERTS UI ---
     try:
         conn = get_db_conn()
-        alerts = pd.read_sql(
-            "SELECT method, l1_type, l1_name, start_time, end_time, status, peak_failures FROM downtime_logs ORDER BY id DESC LIMIT 15", conn
-        )
+        alerts = pd.read_sql("SELECT method, l1_name, start_time, end_time, status, peak_failures, anomaly_score FROM downtime_logs ORDER BY id DESC LIMIT 15", conn)
         conn.close()
-    except Exception:
-        alerts = pd.DataFrame()
+    except: alerts = pd.DataFrame()
         
-    active_critical = len(alerts[alerts['status'] == 'CRITICAL']) if not alerts.empty else 0
-    status_emoji = "🔴" if active_critical > 0 else "🟢"
-    
-    with st.expander(f"🚨 {status_emoji} LIVE DOWNTIME ALERTS CENTER", expanded=True):
-        if active_critical > 0: 
-            st.error(f"⚠️ {active_critical} Critical Sub-Systems Operating at 0% SR!")
-        else: 
-            st.success("✅ All Core Systems Operating Within Bounds.")
-            
+    active = len(alerts[alerts['status'].isin(['CRITICAL', 'DEGRADED'])]) if not alerts.empty else 0
+    with st.expander(f"🚨 {'🔴' if active > 0 else '🟢'} LIVE DOWNTIME & ANOMALY CENTER", expanded=True):
+        if active > 0: st.error(f"⚠️ {active} Systems showing 0% SR or Statistical Drops!")
+        else: st.success("✅ All Core Systems Operating Within Dynamic Baseline.")
+        
         if not alerts.empty:
-            alerts['start_time'] = pd.to_datetime(alerts['start_time']).dt.strftime('%Y-%m-%d %H:%M:%S')
-            alerts['end_time'] = pd.to_datetime(alerts['end_time']).dt.strftime('%Y-%m-%d %H:%M:%S').replace('NaT', '-')
+            alerts['start_time'] = pd.to_datetime(alerts['start_time']).dt.strftime('%H:%M')
+            alerts['end_time'] = pd.to_datetime(alerts['end_time']).dt.strftime('%H:%M').replace('NaT', '-')
             
-            def color_alert_status(val):
-                if val == 'CRITICAL': return 'color: white; background-color: #721c24; font-weight: bold;'
-                elif val == 'RESOLVED': return 'color: white; background-color: #155724; font-weight: bold;'
+            def color_alert(val):
+                if val == 'CRITICAL': return 'background-color: #721c24; color: white;'
+                if val == 'DEGRADED': return 'background-color: #856404; color: white;' # Yellow for Z-score drops
+                if val == 'RESOLVED': return 'background-color: #155724; color: white;'
                 return ''
-                
-            st.dataframe(alerts.style.applymap(color_alert_status, subset=['status']), use_container_width=True, hide_index=True)
+            st.dataframe(alerts.style.applymap(color_alert, subset=['status']), use_container_width=True, hide_index=True)
             
     st.divider()
 
@@ -460,8 +444,10 @@ if __name__ == "__main__":
             render_pane(d, 'method_drilled', "Card Matrix SR Trend", gran)
             render_pane(d, 'cps_route', "Cards CPS Performance", gran)
             render_pane(d[d['lt']=='credit'], 'network', "CC Network Health", gran)
+            render_pane(d[d['lt']=='credit'], 'gateway', "CC Gateway Performance", gran)
             render_pane(d[d['lt']=='credit'], 'issuer', "CC Issuer Performance", gran)
             render_pane(d[d['lt']=='debit'], 'network', "DC Network Health", gran)
+            render_pane(d[d['lt']=='debit'], 'gateway', "DC Gateway Performance", gran)
             render_pane(d[d['lt']=='debit'], 'issuer', "DC Issuer Performance", gran)
             render_pane(d, 'internal_error_code', "Cards Error Analytics", gran)
 

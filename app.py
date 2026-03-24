@@ -107,39 +107,32 @@ def check_downtimes(df, method_name, l1_col, conn, table_name):
     latest_dt = df['dt'].max()
     time_str = pd.to_datetime(latest_dt).strftime('%Y-%m-%d %H:%M:%S')
     
-    # --- 1. GLOBAL CHECK: Is the entire method dead? ---
+    # 1. SYSTEM-WIDE CHECK
     total_att = df[df['dt'] == latest_dt]['attempts'].sum()
     total_succ = df[df['dt'] == latest_dt]['success'].sum()
-    
     if total_att > 100 and total_succ == 0:
         exists = pd.read_sql(f"SELECT id FROM downtime_logs WHERE method='{method_name}' AND l1_name='GLOBAL' AND status='SYSTEM-WIDE'", conn)
         if exists.empty:
             conn.execute("INSERT INTO downtime_logs (method, l1_type, l1_name, start_time, status, peak_failures, anomaly_score) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                         (method_name, 'ALL', 'GLOBAL', time_str, 'SYSTEM-WIDE', total_att, 100.0))
-        return # If the whole method is down, skip individual L1 noise
+                         (method_name, 'ALL', 'GLOBAL', time_str, 'SYSTEM-WIDE', int(total_att), 100.0))
+        return
 
-    # --- 2. L1 CHECK: Gateway/Bank logic ---
+    # 2. L1 ANOMALY CHECK
     recent = df[df['dt'] == latest_dt].groupby(l1_col).agg({'attempts': 'sum', 'success': 'sum'}).reset_index()
-    try:
-        hist_df = pd.read_sql(f"SELECT {l1_col}, attempts, success FROM {table_name} WHERE dt >= datetime('now', '-2 hours')", conn)
+    try: hist_df = pd.read_sql(f"SELECT {l1_col}, attempts, success FROM {table_name} WHERE dt >= datetime('now', '-2 hours')", conn)
     except: hist_df = pd.DataFrame()
 
     for _, row in recent.iterrows():
         name = str(row[l1_col])
         if name.strip() == '' or name.lower() in ['nan', 'none', 'unknown']: continue
-            
-        cur_att = int(row['attempts'])
-        cur_sr = (row['success'] / cur_att * 100) if cur_att > 0 else 0
+        cur_att, cur_sr = int(row['attempts']), (row['success'] / row['attempts'] * 100) if row['attempts'] > 0 else 0
         status, score = None, 0.0
-
-        if cur_att > 20 and row['success'] == 0:
-            status, score = "CRITICAL", 99.0 
+        if cur_att > 20 and row['success'] == 0: status, score = "CRITICAL", 99.0 
         elif not hist_df.empty and cur_att > 50:
             h = hist_df[hist_df[l1_col] == name].copy()
             if len(h) > 10:
                 h['sr'] = (h['success'] / h['attempts'] * 100).fillna(0)
-                mean_sr, std_sr = h['sr'].mean(), h['sr'].std()
-                z = (cur_sr - mean_sr) / (std_sr if std_sr > 0.5 else 1.0)
+                z = (cur_sr - h['sr'].mean()) / (h['sr'].std() if h['sr'].std() > 0.5 else 1.0)
                 if z < -3.0: status, score = "DEGRADED", abs(round(z, 2))
 
         if status:
@@ -147,45 +140,44 @@ def check_downtimes(df, method_name, l1_col, conn, table_name):
             if exists.empty:
                 conn.execute("INSERT INTO downtime_logs (method, l1_type, l1_name, start_time, status, peak_failures, anomaly_score) VALUES (?, ?, ?, ?, ?, ?, ?)",
                              (method_name, l1_col, name, time_str, status, cur_att, score))
-            else:
-                conn.execute("UPDATE downtime_logs SET peak_failures = MAX(peak_failures, ?), anomaly_score = MAX(anomaly_score, ?) WHERE method = ? AND l1_name = ? AND status IN ('CRITICAL', 'DEGRADED')",
-                             (cur_att, score, method_name, name))
         elif cur_sr > 2:
-            conn.execute("UPDATE downtime_logs SET end_time = ?, status = 'RESOLVED' WHERE method = ? AND l1_name = ? AND status IN ('CRITICAL', 'DEGRADED', 'SYSTEM-WIDE')",
-                         (time_str, method_name, name))
-
+            conn.execute("UPDATE downtime_logs SET end_time = ?, status = 'RESOLVED' WHERE method = ? AND l1_name = ? AND status IN ('CRITICAL', 'DEGRADED', 'SYSTEM-WIDE')", (time_str, method_name, name))
 def execute_single_sync(table_name, sql, user, pwd):
-    """Executes a sync task and applies domain-specific downtime checks."""
     try:
         df = run_trino_query(sql, user, pwd)
         if not df.empty:
             conn = get_db_conn()
-            min_dt = str(df['dt'].min())
+            # 1. Cast to datetime to ensure min_dt is a valid timestamp string
+            df['dt'] = pd.to_datetime(df['dt'])
+            min_dt = df['dt'].min().strftime('%Y-%m-%d %H:%M:%S')
+            
+            # 2. Wipe the overlap window (The de-duplicator)
             try: conn.execute(f"DELETE FROM {table_name} WHERE dt >= ?", (min_dt,))
-            except Exception: pass
+            except: pass
                 
             df.to_sql(table_name, conn, if_exists='append', index=False)
             
-        if table_name == 'upi_data': 
-            check_downtimes(df, 'Standard UPI', 'gateway', conn, table_name)
-            check_downtimes(df, 'Standard UPI', 'bank', conn, table_name)
-            check_downtimes(df, 'Standard UPI', 'cps_route', conn, table_name)
-        elif table_name == 'cards_data': 
-            check_downtimes(df, 'Cards', 'issuer', conn, table_name)
-            check_downtimes(df, 'Cards', 'network', conn, table_name)
-            check_downtimes(df, 'Cards', 'gateway', conn, table_name)
-        elif table_name == 'nb_data': 
-            check_downtimes(df, 'Netbanking', 'bank', conn, table_name)
-            check_downtimes(df, 'Netbanking', 'gateway', conn, table_name)
-        elif table_name == 'emandate_data':
-            check_downtimes(df, 'Emandate', 'bank', conn, table_name)
-            
-        conn.commit()
-        conn.close()
-        log_event(f"✅ {table_name} Sync Complete.")
+            # 3. MOVED INSIDE: Only check anomalies if we actually got new data
+            if table_name == 'upi_data': 
+                check_downtimes(df, 'Standard UPI', 'gateway', conn, table_name)
+                check_downtimes(df, 'Standard UPI', 'bank', conn, table_name)
+                check_downtimes(df, 'Standard UPI', 'cps_route', conn, table_name)
+            elif table_name == 'cards_data': 
+                check_downtimes(df, 'Cards', 'issuer', conn, table_name)
+                check_downtimes(df, 'Cards', 'network', conn, table_name)
+                check_downtimes(df, 'Cards', 'gateway', conn, table_name)
+            elif table_name == 'nb_data': 
+                check_downtimes(df, 'Netbanking', 'bank', conn, table_name)
+                check_downtimes(df, 'Netbanking', 'gateway', conn, table_name)
+            elif table_name == 'emandate_data':
+                check_downtimes(df, 'Emandate', 'bank', conn, table_name)
+                
+            conn.commit()
+            conn.close()
+            log_event(f"✅ {table_name} Sync Complete.")
     except Exception as e: 
         log_event(f"❌ {table_name} Failed: {str(e)[:50]}")
-
+        
 def background_engine(user, pwd):
     """Continuous polling loop."""
     log_event("🚀 Engine Online. Starting 24H Backfill...")
@@ -523,61 +515,46 @@ if __name__ == "__main__":
     }
 
     st.divider()
-    st.subheader("🎯 Merchant Impact Explorer (One-Click)")
-    
-    # Persistence: Use session state to remember the last lookback used
-    if 'imp_lookback' not in st.session_state: st.session_state.imp_lookback = 60
-    
-    with st.expander("Configure Blast Radius", expanded=True):
+    st.subheader("🎯 Merchant Impact Explorer (Manual Precision)")
+    with st.expander("Investigate Incident Window (A to B)", expanded=True):
         with st.form("impact_form"):
-            col1, col2, col3 = st.columns([1, 1, 1])
-            with col1:
-                imp_sub_cat = st.selectbox("Flow Category", list(IMPACT_MAPPINGS.keys()))
-                imp_dim = st.selectbox("Dimension (L1)", ['gateway', 'bank', 'issuer', 'network', 'provider', 'cps_route'])
-            with col2:
-                imp_val = st.text_input("Dimension Value (e.g. upi_mindgate)")
-                lookback_val = st.slider("Lookback (Minutes)", 5, 240, st.session_state.imp_lookback)
-            with col3:
-                # Automatic timestamp generation
-                t_end = datetime.now()
-                t_start = t_end - timedelta(minutes=lookback_val)
-                st.info(f"Window: {t_start.strftime('%H:%M')} to {t_end.strftime('%H:%M')}")
-                st.write("")
-                submit_impact = st.form_submit_button("Fetch Impact List")
+            col_setup, col_start, col_end = st.columns([2, 1.5, 1.5])
+            with col_setup:
+                # Key parameter ensures persistent state
+                imp_sub_cat = st.selectbox("Flow Category", list(IMPACT_MAPPINGS.keys()), key="f_cat")
+                imp_dim = st.selectbox("Dimension (L1)", ['gateway', 'bank', 'issuer', 'network', 'provider', 'cps_route'], key="f_dim")
+                imp_val = st.text_input("Dimension Value (e.g. upi_mindgate)", key="f_val")
+            with col_start:
+                st.write("**Incident Start**")
+                s_date = st.date_input("Date", datetime.now(), key="f_sd")
+                s_hour = st.number_input("Hour (0-23)", 0, 23, datetime.now().hour, key="f_sh")
+                s_min = st.number_input("Minute (0-59)", 0, 59, 0, key="f_sm")
+            with col_end:
+                st.write("**Incident End**")
+                e_date = st.date_input("Date", datetime.now(), key="f_ed")
+                e_hour = st.number_input("Hour (0-23)", 0, 23, datetime.now().hour, key="f_eh")
+                e_min = st.number_input("Minute (0-59)", 0, 59, 59, key="f_em")
+            submit_impact = st.form_submit_button("Fetch Impact List")
 
     if submit_impact:
-        st.session_state.imp_lookback = lookback_val
-        where_clause = IMPACT_MAPPINGS[imp_sub_cat]
-        
+        ts_start = f"{s_date.strftime('%Y-%m-%d')} {s_hour:02}:{s_min:02}:00"
+        ts_end = f"{e_date.strftime('%Y-%m-%d')} {e_hour:02}:{e_min:02}:59"
         impact_sql = f"""
         WITH summary_data AS (
-            SELECT 
-                GROUPING(business_dba) AS is_total,
-                business_dba,
-                merchant_id,
-                COUNT(id) AS Attempts,
-                COUNT(IF (authorized_at <> 0, id, NULL)) * 100.0 / NULLIF(COUNT(id), 0) AS SR
+            SELECT GROUPING(business_dba) AS is_total, business_dba, merchant_id, COUNT(id) AS Attempts,
+            COUNT(IF (authorized_at <> 0, id, NULL)) * 100.0 / NULLIF(COUNT(id), 0) AS SR
             FROM startree.default.sr_view_v9
-            WHERE {where_clause}
-                AND status <> 'created'
-                AND {imp_dim} = '{imp_val}'
-                AND created_at BETWEEN (to_unixtime(timestamp '{t_start.strftime('%Y-%m-%d %H:%M:%S')}') - 19800) 
-                                   AND (to_unixtime(timestamp '{t_end.strftime('%Y-%m-%d %H:%M:%S')}') - 19800)
+            WHERE {IMPACT_MAPPINGS[imp_sub_cat]} AND status <> 'created' AND {imp_dim} = '{imp_val}'
+            AND (created_at + 19800) BETWEEN (to_unixtime(timestamp '{ts_start}')) AND (to_unixtime(timestamp '{ts_end}'))
             GROUP BY GROUPING SETS ((business_dba, merchant_id), ())
         )
-        SELECT 
-            CASE WHEN is_total = 1 THEN ' GRAND TOTAL ' ELSE business_dba END AS business_dba,
-            COALESCE(merchant_id, '-') AS merchant_id,
-            Attempts,
-            SR
-        FROM summary_data
+        SELECT CASE WHEN is_total = 1 THEN ' GRAND TOTAL ' ELSE business_dba END AS business_dba,
+        COALESCE(merchant_id, '-') AS merchant_id, Attempts, SR FROM summary_data
         ORDER BY is_total DESC, Attempts DESC
         """
-        
-        with st.spinner("Fetching Blast Radius..."):
+        with st.spinner("Executing Trino Query..."):
             imp_df = run_trino_query(impact_sql, st.session_state['u'], st.session_state['p'])
             if not imp_df.empty:
                 imp_df['SR'] = imp_df['SR'].apply(lambda x: f"{x:.2f}%" if pd.notnull(x) else "0.00%")
                 st.dataframe(imp_df, use_container_width=True, hide_index=True)
-            else:
-                st.warning("No merchants found in this time window.")
+            else: st.warning("No data found for this window.")

@@ -152,8 +152,10 @@ def execute_single_sync(table_name, sql, user, pwd):
             min_dt = df['dt'].min().strftime('%Y-%m-%d %H:%M:%S')
             
             # 2. Wipe the overlap window (The de-duplicator)
-            try: conn.execute(f"DELETE FROM {table_name} WHERE dt >= ?", (min_dt,))
-            except: pass
+            try: 
+                conn.execute(f"DELETE FROM {table_name} WHERE dt >= ?", (min_dt,))
+            except Exception as db_err:
+                log_event(f"❌ {table_name} DB Cleanup Error: {str(db_err)[:40]}")
                 
             df.to_sql(table_name, conn, if_exists='append', index=False)
             
@@ -176,7 +178,7 @@ def execute_single_sync(table_name, sql, user, pwd):
             conn.close()
             log_event(f"✅ {table_name} Sync Complete.")
     except Exception as e: 
-        log_event(f"❌ {table_name} Failed: {str(e)[:50]}")
+        log_event(f"❌ {table_name} Failed: {str(e)[:60]}")
         
 def background_engine(user, pwd):
     """Continuous polling loop."""
@@ -240,7 +242,12 @@ def background_engine(user, pwd):
             log_event("INITIAL_SYNC_COMPLETE")
             first_run = False
             
-        time.sleep(300)
+        now = time.time()
+        sleep_time = 300 - (now % 300)
+        next_run = datetime.fromtimestamp(now + sleep_time).strftime('%H:%M:%S')
+        log_event(f"💤 Sleeping. Next Aligned Sync at {next_run}")
+        
+        time.sleep(sleep_time)
 
 # --- 4. RENDER UTILS ---
 def z_score_styler(df):
@@ -332,18 +339,25 @@ if __name__ == "__main__":
     
     with st.sidebar:
         st.title("⚙️ Command")
-        lb = st.selectbox("History",[1, 2, 6, 12], index=1)
-        gran = st.selectbox("Granularity",["1min", "5min", "15min", "1h"], index=1)
+        lb = st.selectbox("History", [1, 2, 6, 12], index=1)
+        gran = st.selectbox("Granularity", ["1min", "5min", "15min", "1h"], index=1)
         
         st.divider()
-        with st.expander("📡 Engine Sync Logs", expanded=False):
+        with st.expander("📡 Engine Sync Logs", expanded=True): # Kept expanded so you see it
             try:
                 conn = get_db_conn()
-                sync_logs = pd.read_sql("SELECT timestamp, message FROM system_logs ORDER BY id DESC LIMIT 25", conn)
+                # Pull last 30 logs
+                sync_logs = pd.read_sql("SELECT timestamp, message FROM system_logs ORDER BY id DESC LIMIT 30", conn)
                 conn.close()
                 for _, r in sync_logs.iterrows():
-                    st.caption(f"[{r['timestamp']}] {r['message']}")
-            except Exception: pass
+                    # Color success and fail differently
+                    if "✅" in r['message']:
+                        st.caption(f"**{r['timestamp']}** :green[{r['message']}]")
+                    elif "❌" in r['message']:
+                        st.caption(f"**{r['timestamp']}** :red[{r['message']}]")
+                    else:
+                        st.caption(f"**{r['timestamp']}** {r['message']}")
+            except: pass
 
     def get_data(table):
         try:

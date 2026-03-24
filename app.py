@@ -102,12 +102,13 @@ def log_event(msg):
         pass
 
 # --- 3. BACKGROUND WORKER & ENHANCED DOWNTIME LOGIC ---
+
 def check_downtimes(df, method_name, l1_col, conn, table_name):
     if df.empty: return
     latest_dt = df['dt'].max()
     time_str = pd.to_datetime(latest_dt).strftime('%Y-%m-%d %H:%M:%S')
     
-    # 1. SYSTEM-WIDE CHECK
+    # 1. GLOBAL BLACKOUT CHECK
     total_att = df[df['dt'] == latest_dt]['attempts'].sum()
     total_succ = df[df['dt'] == latest_dt]['success'].sum()
     if total_att > 100 and total_succ == 0:
@@ -115,51 +116,63 @@ def check_downtimes(df, method_name, l1_col, conn, table_name):
         if exists.empty:
             conn.execute("INSERT INTO downtime_logs (method, l1_type, l1_name, start_time, status, peak_failures, anomaly_score) VALUES (?, ?, ?, ?, ?, ?, ?)",
                          (method_name, 'ALL', 'GLOBAL', time_str, 'SYSTEM-WIDE', int(total_att), 100.0))
-        return
+        return 
 
     # 2. L1 ANOMALY CHECK
     recent = df[df['dt'] == latest_dt].groupby(l1_col).agg({'attempts': 'sum', 'success': 'sum'}).reset_index()
-    try: hist_df = pd.read_sql(f"SELECT {l1_col}, attempts, success FROM {table_name} WHERE dt >= datetime('now', '-2 hours')", conn)
+    try:
+        hist_df = pd.read_sql(f"SELECT {l1_col}, attempts, success FROM {table_name} WHERE dt >= datetime('now', '-2 hours')", conn)
     except: hist_df = pd.DataFrame()
 
     for _, row in recent.iterrows():
         name = str(row[l1_col])
         if name.strip() == '' or name.lower() in ['nan', 'none', 'unknown']: continue
-        cur_att, cur_sr = int(row['attempts']), (row['success'] / row['attempts'] * 100) if row['attempts'] > 0 else 0
+        cur_att = int(row['attempts'])
+        cur_sr = (row['success'] / cur_att * 100) if cur_att > 0 else 0
         status, score = None, 0.0
-        if cur_att > 20 and row['success'] == 0: status, score = "CRITICAL", 99.0 
-        elif not hist_df.empty and cur_att > 50:
+
+        # CRITICAL: Hard 0% SR
+        if cur_att > 20 and row['success'] == 0:
+            status, score = "CRITICAL", 99.0 
+        
+        # DEGRADED: Dynamic Anomaly (Hardened)
+        elif not hist_df.empty and cur_att > 100: # Only alert on significant volume
             h = hist_df[hist_df[l1_col] == name].copy()
-            if len(h) > 10:
+            if len(h) > 15:
                 h['sr'] = (h['success'] / h['attempts'] * 100).fillna(0)
-                z = (cur_sr - h['sr'].mean()) / (h['sr'].std() if h['sr'].std() > 0.5 else 1.0)
-                if z < -3.0: status, score = "DEGRADED", abs(round(z, 2))
+                mean_sr, std_sr = h['sr'].mean(), h['sr'].std()
+                z = (cur_sr - mean_sr) / (std_sr if std_sr > 1.0 else 1.0)
+                
+                # REQUIREMENT: Z < -4 (High Confidence) AND Current SR is > 10% lower than Mean
+                if z < -4.0 and (mean_sr - cur_sr) > 10.0:
+                    status, score = "DEGRADED", abs(round(z, 2))
 
         if status:
             exists = pd.read_sql(f"SELECT id FROM downtime_logs WHERE method='{method_name}' AND l1_name='{name}' AND status IN ('CRITICAL', 'DEGRADED')", conn)
             if exists.empty:
                 conn.execute("INSERT INTO downtime_logs (method, l1_type, l1_name, start_time, status, peak_failures, anomaly_score) VALUES (?, ?, ?, ?, ?, ?, ?)",
                              (method_name, l1_col, name, time_str, status, cur_att, score))
-        elif cur_sr > 2:
-            conn.execute("UPDATE downtime_logs SET end_time = ?, status = 'RESOLVED' WHERE method = ? AND l1_name = ? AND status IN ('CRITICAL', 'DEGRADED', 'SYSTEM-WIDE')", (time_str, method_name, name))
+        elif cur_sr > (mean_sr - 2.0 if 'mean_sr' in locals() else 5.0):
+            # Resolve if within 2% of mean
+            conn.execute("UPDATE downtime_logs SET end_time = ?, status = 'RESOLVED' WHERE method = ? AND l1_name = ? AND status IN ('CRITICAL', 'DEGRADED', 'SYSTEM-WIDE')",
+                         (time_str, method_name, name))
+
 def execute_single_sync(table_name, sql, user, pwd):
+    start_ts = time.time() # Start Latency Timer
     try:
         df = run_trino_query(sql, user, pwd)
+        duration = round(time.time() - start_ts, 1) # Calculate Latency
+        
         if not df.empty:
             conn = get_db_conn()
-            # 1. Cast to datetime to ensure min_dt is a valid timestamp string
             df['dt'] = pd.to_datetime(df['dt'])
             min_dt = df['dt'].min().strftime('%Y-%m-%d %H:%M:%S')
             
-            # 2. Wipe the overlap window (The de-duplicator)
-            try: 
-                conn.execute(f"DELETE FROM {table_name} WHERE dt >= ?", (min_dt,))
-            except Exception as db_err:
-                log_event(f"❌ {table_name} DB Cleanup Error: {str(db_err)[:40]}")
+            try: conn.execute(f"DELETE FROM {table_name} WHERE dt >= ?", (min_dt,))
+            except: pass
                 
             df.to_sql(table_name, conn, if_exists='append', index=False)
             
-            # 3. MOVED INSIDE: Only check anomalies if we actually got new data
             if table_name == 'upi_data': 
                 check_downtimes(df, 'Standard UPI', 'gateway', conn, table_name)
                 check_downtimes(df, 'Standard UPI', 'bank', conn, table_name)
@@ -173,95 +186,100 @@ def execute_single_sync(table_name, sql, user, pwd):
                 check_downtimes(df, 'Netbanking', 'gateway', conn, table_name)
             elif table_name == 'emandate_data':
                 check_downtimes(df, 'Emandate', 'bank', conn, table_name)
+            elif table_name == 'recurring_data':
+                check_downtimes(df, 'UPI Recurring', 'gateway', conn, table_name)
                 
             conn.commit()
             conn.close()
-            log_event(f"✅ {table_name} Sync Complete.")
+            # LOG SUCCESS WITH LATENCY
+            log_event(f"✅ {table_name} Integrated: {len(df)} rows (Took {duration}s)")
+        else:
+            log_event(f"⚠️ {table_name} returned 0 rows (Took {duration}s)")
     except Exception as e: 
-        log_event(f"❌ {table_name} Failed: {str(e)[:60]}")
+        log_event(f"❌ {table_name} Failed after {round(time.time()-start_ts,1)}s: {str(e)[:40]}")
         
 def background_engine(user, pwd):
-    """Continuous polling loop."""
     log_event("🚀 Engine Online. Starting 24H Backfill...")
     first_run = True
-    
     while True:
         lookback = 86400 if first_run else 900 
-        t_filter = f"created_at >= CAST(TO_UNIXTIME(CURRENT_TIMESTAMP) AS BIGINT) - {lookback}"
+        t_filter = f"(created_at + 19800) >= CAST(TO_UNIXTIME(CURRENT_TIMESTAMP) AS BIGINT) + 19800 - {lookback}"
         
+        # LOG INITIATION
+        fire_time = datetime.now().strftime('%H:%M:%S')
+        log_event(f"📡 Batch Sync Triggered at {fire_time}")
+        
+        # ... queries dict remains same ...
         queries = {
-            'upi_data': f"""
-                SELECT DATE_TRUNC('minute', FROM_UNIXTIME(created_at + 19800)) AS dt, 
-                method, flow, mode, receiver_type, reference2, gateway, provider, 
-                bank, cps_route, internal_error_code, 
-                COUNT(id) as attempts, SUM(CASE WHEN authorized_at > 0 THEN 1 ELSE 0 END) as success 
-                FROM startree.default.sr_view_v9 
-                WHERE {t_filter} AND status <> 'created' AND method = 'upi' AND recurring = 0 AND international = 0 
-                GROUP BY 1,2,3,4,5,6,7,8,9,10,11
-            """,
-            'cards_data': f"""
-                SELECT DATE_TRUNC('minute', FROM_UNIXTIME(created_at + 19800)) AS dt, 
-                method, type, international, recurring, recurring_type, network, issuer, 
-                cps_route, gateway, internal_error_code, 
-                COUNT(id) as attempts, SUM(CASE WHEN authorized_at > 0 THEN 1 ELSE 0 END) as success 
-                FROM startree.default.sr_view_v9 
-                WHERE {t_filter} AND status <> 'created' AND method IN ('card', 'emi') 
-                GROUP BY 1,2,3,4,5,6,7,8,9,10,11
-            """,
-            'nb_data': f"""
-                SELECT DATE_TRUNC('minute', FROM_UNIXTIME(created_at + 19800)) AS dt, 
-                method, bank, gateway, provider, 
-                COUNT(id) as attempts, SUM(CASE WHEN authorized_at > 0 THEN 1 ELSE 0 END) as success 
-                FROM startree.default.sr_view_v9 
-                WHERE {t_filter} AND status <> 'created' AND method IN ('netbanking', 'wallet', 'app') 
-                GROUP BY 1,2,3,4,5
-            """,
-            'emandate_data': f"""
-                SELECT DATE_TRUNC('minute', FROM_UNIXTIME(created_at + 19800)) AS dt, 
-                method, recurring, recurring_type, bank, auth_type, gateway, 
-                COUNT(id) as attempts, SUM(CASE WHEN authorized_at > 0 THEN 1 ELSE 0 END) as success 
-                FROM startree.default.sr_view_v9 
-                WHERE {t_filter} AND status <> 'created' AND method IN ('emandate', 'nach') 
-                GROUP BY 1,2,3,4,5,6,7
-            """,
-            'recurring_data': f"""
-                SELECT DATE_TRUNC('minute', FROM_UNIXTIME(created_at + 19800)) AS dt, 
-                method, recurring, flow, recurring_type, gateway, 
-                COUNT(id) as attempts, SUM(CASE WHEN authorized_at > 0 THEN 1 ELSE 0 END) as success 
-                FROM startree.default.sr_view_v9 
-                WHERE {t_filter} AND status <> 'created' AND recurring = 1 AND method = 'upi' 
-                GROUP BY 1,2,3,4,5,6
-            """
+            'upi_data': f"SELECT DATE_TRUNC('minute', FROM_UNIXTIME(created_at + 19800)) AS dt, method, flow, mode, receiver_type, reference2, gateway, provider, bank, cps_route, internal_error_code, COUNT(id) as attempts, SUM(CASE WHEN authorized_at > 0 THEN 1 ELSE 0 END) as success FROM startree.default.sr_view_v9 WHERE {t_filter} AND status <> 'created' AND method = 'upi' AND recurring = 0 AND international = 0 GROUP BY 1,2,3,4,5,6,7,8,9,10,11",
+            'cards_data': f"SELECT DATE_TRUNC('minute', FROM_UNIXTIME(created_at + 19800)) AS dt, method, type, international, recurring, recurring_type, network, issuer, cps_route, gateway, internal_error_code, COUNT(id) as attempts, SUM(CASE WHEN authorized_at > 0 THEN 1 ELSE 0 END) as success FROM startree.default.sr_view_v9 WHERE {t_filter} AND status <> 'created' AND method IN ('card', 'emi') GROUP BY 1,2,3,4,5,6,7,8,9,10,11",
+            'nb_data': f"SELECT DATE_TRUNC('minute', FROM_UNIXTIME(created_at + 19800)) AS dt, method, bank, gateway, provider, COUNT(id) as attempts, SUM(CASE WHEN authorized_at > 0 THEN 1 ELSE 0 END) as success FROM startree.default.sr_view_v9 WHERE {t_filter} AND status <> 'created' AND method IN ('netbanking', 'wallet', 'app') GROUP BY 1,2,3,4,5",
+            'emandate_data': f"SELECT DATE_TRUNC('minute', FROM_UNIXTIME(created_at + 19800)) AS dt, method, recurring, recurring_type, bank, auth_type, gateway, COUNT(id) as attempts, SUM(CASE WHEN authorized_at > 0 THEN 1 ELSE 0 END) as success FROM startree.default.sr_view_v9 WHERE {t_filter} AND status <> 'created' AND method IN ('emandate', 'nach') GROUP BY 1,2,3,4,5,6,7",
+            'recurring_data': f"SELECT DATE_TRUNC('minute', FROM_UNIXTIME(created_at + 19800)) AS dt, method, recurring, flow, recurring_type, gateway, COUNT(id) as attempts, SUM(CASE WHEN authorized_at > 0 THEN 1 ELSE 0 END) as success FROM startree.default.sr_view_v9 WHERE {t_filter} AND status <> 'created' AND recurring = 1 AND method = 'upi' GROUP BY 1,2,3,4,5,6"
         }
-        
+
         with concurrent.futures.ThreadPoolExecutor(max_workers=5) as ex:
-            for t, s in queries.items(): 
-                ex.submit(execute_single_sync, t, s, user, pwd)
-                
-        if first_run: 
-            log_event("INITIAL_SYNC_COMPLETE")
-            first_run = False
-            
+            for t, s in queries.items(): ex.submit(execute_single_sync, t, s, user, pwd)
+        
+        if first_run: log_event("INITIAL_SYNC_COMPLETE"); first_run = False
+        
         now = time.time()
         sleep_time = 300 - (now % 300)
         next_run = datetime.fromtimestamp(now + sleep_time).strftime('%H:%M:%S')
         log_event(f"💤 Sleeping. Next Aligned Sync at {next_run}")
-        
         time.sleep(sleep_time)
 
 # --- 4. RENDER UTILS ---
-def z_score_styler(df):
-    styles = pd.DataFrame('', index=df.index, columns=df.columns)
-    sr_cols = [c for c in df.columns if c[1] == 'SR']
-    if not sr_cols: return styles
-    num_sr = df[sr_cols].astype(float)
-    row_means = num_sr.mean(axis=1).values[:, None]
-    row_stds = num_sr.std(axis=1).values[:, None]
-    z = (num_sr.values - row_means) / np.where(row_stds < 1.0, 1.0, row_stds)
-    sr_styles = np.full(num_sr.shape, '', dtype=object)
-    sr_styles[z <= -1.0] = 'background-color: #856404; color: white;' 
-    sr_styles[z <= -2.0] = 'background-color: #721c24; color: white; font-weight: bold;' 
-    styles[sr_cols] = sr_styles
+def get_relative_text_color(val, row_min, row_max, is_sr=True):
+    """Interpolates text color with a sensitivity dead-zone."""
+    try:
+        val, r_min, r_max = float(val), float(row_min), float(row_max)
+        
+        # SENSITIVITY FLOOR: If the total drop in the row is tiny (< 5%), don't show Red.
+        sensitivity_threshold = 5.0
+        if (r_max - r_min) < sensitivity_threshold:
+            if is_sr:
+                return 'color: #2e7d32; font-weight: bold;' if r_max > 80 else 'color: #e61919; font-weight: bold;'
+            else:
+                return 'color: #2e7d32; font-weight: bold;' if r_max < 10 else 'color: #e61919; font-weight: bold;'
+
+        # Calculate relative position
+        pos = (val - r_min) / (r_max - r_min)
+        if not is_sr: pos = 1 - pos 
+        
+        # Damping the gradient: Makes the 'Yellow' zone wider so it's less jumpy
+        if pos > 0.8: # Top 20% performance -> Solid Green
+            r, g = 0, 180
+        elif pos < 0.2: # Bottom 20% performance -> Solid Red
+            r, g = 230, 0
+        elif pos < 0.5: # Red to Yellow
+            r, g = 230, int(420 * pos)
+        else: # Yellow to Green
+            r, g = int(420 * (1 - pos)), 180
+            
+        return f'color: rgb({r},{g},0); font-weight: bold;'
+    except: return ''
+
+def color_grade_styler(row):
+    """Applies relative heatmapping to text in a single row."""
+    styles = ['' for _ in row.index]
+    
+    # Apply to SR columns
+    sr_indices = [i for i, col in enumerate(row.index) if col[1] == 'SR']
+    if sr_indices:
+        vals = row.iloc[sr_indices].astype(float)
+        r_min, r_max = vals.min(), vals.max()
+        for idx in sr_indices:
+            styles[idx] = get_relative_text_color(row.iloc[idx], r_min, r_max, is_sr=True)
+            
+    # Apply to % Share columns
+    share_indices = [i for i, col in enumerate(row.index) if col[1] == '% Share']
+    if share_indices:
+        vals = row.iloc[share_indices].astype(float)
+        r_min, r_max = vals.min(), vals.max()
+        for idx in share_indices:
+            styles[idx] = get_relative_text_color(row.iloc[idx], r_min, r_max, is_sr=False)
+            
     return styles
 
 def render_pane(df, dimension, title, gran):
@@ -270,38 +288,31 @@ def render_pane(df, dimension, title, gran):
     work_df = df.copy()
     work_df[dimension] = work_df[dimension].fillna('Unknown')
     work_df['dt_bucket'] = work_df['dt'].dt.floor(gran)
-    
     pivot = work_df.pivot_table(index=dimension, columns='dt_bucket', values=['attempts', 'success'], aggfunc='sum').fillna(0)
     pivot.columns = pivot.columns.swaplevel(0, 1)
     
-    frames =[]
+    frames = []
     for ts in sorted(work_df['dt_bucket'].dropna().unique()):
         if ts in pivot:
-            a = pivot[ts]['attempts'].astype(int)
-            s = pivot[ts]['success'].astype(int)
-            
-            # --- DYNAMIC METRIC SWITCHER ---
+            a, s = pivot[ts]['attempts'].astype(int), pivot[ts]['success'].astype(int)
             if dimension == 'internal_error_code':
-                total_a = a.sum()
-                metric_val = (a / total_a * 100).fillna(0) if total_a > 0 else a * 0
-                metric_name = '% Share'
+                m_val, m_name = (a / a.sum() * 100).fillna(0) if a.sum() > 0 else a * 0, '% Share'
             else:
-                metric_val = ((s / a.replace(0, np.nan)) * 100).fillna(0)
-                metric_name = 'SR'
-                
-            # Changed 'Vol' to 'Attempts'
-            frames.append(pd.DataFrame({(ts.strftime('%H:%M'), 'Attempts'): a, (ts.strftime('%H:%M'), metric_name): metric_val}))
+                m_val, m_name = ((s / a.replace(0, np.nan)) * 100).fillna(0), 'SR'
+            frames.append(pd.DataFrame({(ts.strftime('%H:%M'), 'Attempts'): a, (ts.strftime('%H:%M'), m_name): m_val}))
             
     if frames:
         fdf = pd.concat(frames, axis=1)
         last_t = pd.to_datetime(work_df['dt_bucket']).max().strftime('%H:%M')
+        if (last_t, 'Attempts') in fdf.columns: fdf = fdf.sort_values(by=(last_t, 'Attempts'), ascending=False).head(50)
         
-        # Sort by the new 'Attempts' column instead of 'Vol'
-        if (last_t, 'Attempts') in fdf.columns: 
-            fdf = fdf.sort_values(by=(last_t, 'Attempts'), ascending=False).head(50)
-            
-        # Format both 'SR' and '% Share' as percentages
-        st.dataframe(fdf.style.apply(z_score_styler, axis=None).format({c: '{:.2f}%' if c[1] in ['SR', '% Share'] else '{:,.0f}' for c in fdf.columns}), use_container_width=True)
+        # Applied axis=1 for relative text coloring
+        st.dataframe(
+            fdf.style.apply(color_grade_styler, axis=1).format({
+                c: '{:.2f}%' if c[1] in ['SR', '% Share'] else '{:,.0f}' for c in fdf.columns
+            }), 
+            use_container_width=True
+        )
     st.divider()
 
 # --- 5. MAIN EXECUTION ---

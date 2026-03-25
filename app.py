@@ -506,6 +506,7 @@ if __name__ == "__main__":
         if not d.empty:
             d['method_drilled'] = d['method'].str.upper() + " - " + d['recurring_type'].str.title()
             render_pane(d, 'method_drilled', "Emandate & NACH Matrix", gran)
+            render_pane(d, 'gateway', "Emandate Gateway", gran)
             render_pane(d[d['auth_type'] == 'netbanking'], 'bank', "Emandate Bank (Auth: NB)", gran)
             render_pane(d[d['auth_type'] == 'debitcard'], 'bank', "Emandate Bank (Auth: DC)", gran)
 
